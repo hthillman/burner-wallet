@@ -4,12 +4,61 @@ import Web3 from "web3";
 import Ruler from "./Ruler";
 import {CopyToClipboard} from "react-copy-to-clipboard";
 import axios from "axios";
-import { getConnextClient } from "connext/dist/Connext.js";
+import * as connext from "@connext/client";
+import * as types from "@connext/types";
+import { Contract, ethers as eth } from "ethers";
+import { AddressZero, Zero } from "ethers/constants";
+import tokenArtifacts from "openzeppelin-solidity/build/contracts/ERC20Mintable.json";
+
 import connextLogo from '../connext.jpg';
+
+const { bigNumberify, parseEther, formatEther } = eth.utils
+
 
 const QRCode = require('qrcode.react');
 
 let interval
+
+const toBN = (n) =>
+  bigNumberify(n.toString());
+
+const store = {
+  get: (key) => {
+    const raw = localStorage.getItem(`CF_NODE:${key}`)
+    if (raw) {
+      try {
+        return JSON.parse(raw);
+      } catch {
+        return raw;
+      }
+    }
+    // Handle partial matches so the following line works -.-
+    // https://github.com/counterfactual/monorepo/blob/master/packages/node/src/store.ts#L54
+    if (key.endsWith("channel") || key.endsWith("appInstanceIdToProposedAppInstance")) {
+      const partialMatches = {}
+      for (const k of Object.keys(localStorage)) {
+        if (k.includes(`${key}/`)) {
+          try {
+            partialMatches[k.replace('CF_NODE:', '').replace(`${key}/`, '')] = JSON.parse(localStorage.getItem(k))
+          } catch {
+            partialMatches[k.replace('CF_NODE:', '').replace(`${key}/`, '')] = localStorage.getItem(k)
+          }
+        }
+      }
+      return partialMatches;
+    }
+    return raw;
+  },
+  set: (pairs, allowDelete) => {
+    for (const pair of pairs) {
+      localStorage.setItem(
+        `CF_NODE:${pair.key}`,
+        typeof pair.value === 'string' ? pair.value : JSON.stringify(pair.value),
+      );
+    }
+  }
+};
+
 
 export default class YourModule extends React.Component {
   constructor(props) {
@@ -17,7 +66,12 @@ export default class YourModule extends React.Component {
 
     this.state = {
       yourVar: "",
-      connext: false,
+      channel: false,
+      depositAddr:null,
+      balance:null,
+      xPub:null,
+      token:null,
+      swapRate:null,
       YourContract: false,
       yourContractBalance: 0,
       toAddress: props.scannerState ? props.scannerState.toAddress : "",
@@ -30,43 +84,41 @@ export default class YourModule extends React.Component {
   async initConnext() {
     // set the client options
 
-    let hubUrl="https://hub.connext.network/api/hub"
-    //let hubUrl = "https://rinkeby.hub.connext.network/api/hub";
-    //let ethUrl="https://hub.connext.network/api/eth"
+    let nodeUrl =  'wss://rinkeby.indra.connext.network/api/messaging'
+    let ethProviderUrl =  `https://rinkeby.indra.connext.network/api/ethprovider`
 
-    let connextOptions;
-    if (this.props.privateKey) {
-      const privateKey = this.props.privateKey;
-      connextOptions = {
-        hubUrl,
-        privateKey
+
+      const mnemonic = localStorage.getItem("mnemonic");
+  
+      const options = {
+        mnemonic,
+        logLevel: 5,
+        nodeUrl,
+        ethProviderUrl,
+        store
       };
 
       // instantiate a new instance of the client
-      console.log("GET CONNEXT CLIENT: ", connextOptions);
-      const connext = await getConnextClient(connextOptions);
-      console.log("CONNEXT LOADED:", connext);
+      const channel = await connext.connect(options);
 
-      // the connext client is an event emitter
-      // start the app, and register a listener
-      connext.on("onStateChange", connext => {
-        console.log("Connext STATE CHANGE:", connext);
-        this.setState({ connextInfo: connext });
-      });
+      
+      if (channel) {
+        const xPub = channel.publicIdentifier;
+        const connextConfig = await channel.config();
+        // const token = new Contract(connextConfig.contractAddresses.Token, tokenArtifacts.abi, cfWallet);
+        // const swapRate = formatEther(await channel.getLatestSwapRate(AddressZero, token.address));
+        console.log(`XPUB ${xPub}`)
+        const depositAddr = connext.utils.publicIdentifierToAddress(xPub);
+        console.log(`DEPOSIT ADDRESS DERIVED FROM XPUB ${depositAddr}`)
+        this.setState({channel, depositAddr, xPub});
+      }
 
-      console.log("Starting Connext...");
-      // start connext
-      await connext.start();
-      console.log("STARTED CONNEXT!");
-      this.setState({ connext: connext }, () => {
-        console.log("connext set:", this.state);
-      });
     }
 
-  }
   componentWillUnmount(){
     clearInterval(interval)
   }
+  
   loadMore(){
     let newPercent = this.state.percent+0.6
     if(newPercent>100) newPercent=100
@@ -79,13 +131,32 @@ export default class YourModule extends React.Component {
     interval = setInterval(this.loadMore.bind(this),1000)
   }
 
-  exchangeIfNeeded() {
-    if(this.state && this.state.connextInfo && this.state.connext &&
-      typeof this.state.connext.exchange == "function" &&
-      this.state.connextInfo.persistent.channel.balanceWeiUser !== "0"){
-      console.log(this.state.connextInfo.persistent.channel.balanceWeiUser)
-    this.state.connext.exchange(this.state.connextInfo.persistent.channel
-      .balanceWeiUser, "wei");
+  async refreshBalances() {
+    const { depositAddr, balance, channel, ethprovider, swapRate, token } = this.state;
+    const freeEtherBalance = await channel.getFreeBalance();
+    const freeTokenBalance = await channel.getFreeBalance(token.address);
+    balance.ether = freeEtherBalance[this.state.freeBalanceAddress];
+    balance.token = freeTokenBalance[this.state.freeBalanceAddress];
+    this.setState({ balance });
+  }
+
+
+  async exchangeIfNeeded() {
+    const {channel, balance, toSwap} = this.state;
+    // const swapRate = (await channel.getLatestSwapRate(AddressZero, token.address));
+    await this.refreshBalances();
+
+    if(this.state && this.state.channel && this.state.balance &&
+      typeof this.state.channel.swap == "function" &&
+      balance.ether !== "0"){
+
+        const payload = { 
+          amount: toBN(toSwap),// in Wei, represented as bignumber
+          toAssetId: "0x89d24a6b4ccb1b6faa2625fe562bdd9a23260359", // Dai
+          fromAssetId: AddressZero // ETH
+        }
+        
+    channel.exchange(balance.ether,"wei");
     }
   }
 
